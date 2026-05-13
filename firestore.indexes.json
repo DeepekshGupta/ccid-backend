@@ -1,0 +1,10 @@
+{
+  "indexes": [{
+    "collectionGroup": "activity_log",
+    "queryScope": "COLLECTION",
+    "fields": [
+      { "fieldPath": "dog_id",    "order": "ASCENDING"  },
+      { "fieldPath": "timestamp", "order": "DESCENDING" }
+    ]
+  }]
+}

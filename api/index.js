@@ -3,17 +3,21 @@ const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const admin = require('firebase-admin');
 
-// 1. INITIALIZE FIREBASE (Serverless Singleton Pattern)
+// ---------------------------------------------------------------------------
+// 1. FIREBASE INITIALIZATION (Serverless Singleton Pattern)
+//    Re-uses the existing app across warm Lambda/serverless invocations.
+// ---------------------------------------------------------------------------
 if (!admin.apps.length) {
   const privateKey = process.env.FIREBASE_PRIVATE_KEY;
-  
+
   if (!privateKey) {
-    console.error("CRITICAL: FIREBASE_PRIVATE_KEY is missing!");
+    console.error('CRITICAL: FIREBASE_PRIVATE_KEY is missing!');
   } else {
     admin.initializeApp({
       credential: admin.credential.cert({
         projectId: process.env.FIREBASE_PROJECT_ID,
         clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        // Vercel stores env vars literally — convert escaped newlines back
         privateKey: privateKey.replace(/\\n/g, '\n'),
       }),
     });
@@ -26,12 +30,45 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- HELPERS ---
-const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
+// ---------------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------------
+const { FieldValue } = admin.firestore;
 
-// --- API 1: REGISTER DOG ---
+/**
+ * Recursively convert Firestore Timestamp objects → ISO strings so that
+ * JSON.stringify produces readable dates instead of { _seconds, _nanoseconds }.
+ */
+function serializeDoc(data) {
+  if (data === null || data === undefined) return data;
+  if (data.toDate && typeof data.toDate === 'function') {
+    // Firestore Timestamp
+    return data.toDate().toISOString();
+  }
+  if (Array.isArray(data)) return data.map(serializeDoc);
+  if (typeof data === 'object') {
+    return Object.fromEntries(
+      Object.entries(data).map(([k, v]) => [k, serializeDoc(v)])
+    );
+  }
+  return data;
+}
+
+/** Flatten a Firestore DocumentSnapshot into a plain object. */
+function flattenDoc(doc) {
+  return serializeDoc({ id: doc.id, ...doc.data() });
+}
+
+// ---------------------------------------------------------------------------
+// API 1: REGISTER DOG
+// ---------------------------------------------------------------------------
 app.post('/api/register', async (req, res) => {
-  const { id, name, photo_url, sex, species, age_group, sterilization_status, vaccination_bit_mask, status, is_missing } = req.body;
+  const {
+    id, name, photo_url, sex, species,
+    age_group, sterilization_status, vaccination_bit_mask,
+    status, is_missing,
+  } = req.body;
+
   const dogId = id || `dog_${uuidv4().split('-')[0]}`;
 
   try {
@@ -45,187 +82,300 @@ app.post('/api/register', async (req, res) => {
       vaccination_bit_mask: vaccination_bit_mask || 0,
       status: status || 'Street',
       is_missing: !!is_missing,
-      created_at: serverTimestamp()
+      created_at: FieldValue.serverTimestamp(),
     };
 
     await db.collection('dog_profile').doc(dogId).set(dogData);
-    res.status(201).json({ message: "Dog registered", id: dogId });
+    res.status(201).json({ message: 'Dog registered', id: dogId });
   } catch (err) {
+    console.error('register:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// --- API 2: FETCH DOG PROFILE WITH ACTIVITY LOGGING ---
+// ---------------------------------------------------------------------------
+// API 2: FETCH DOG PROFILE + auto-log the view
+// ---------------------------------------------------------------------------
 app.get('/api/dog/:id', async (req, res) => {
   const dogId = req.params.id;
   const { lat, lon, contributor } = req.query;
-  const gpsLocation = (lat && lon) ? `${lat},${lon}` : 'Unknown';
+  const gpsLocation = lat && lon ? `${lat},${lon}` : 'Unknown';
 
   try {
     const doc = await db.collection('dog_profile').doc(dogId).get();
-    if (!doc.exists) return res.status(404).json({ error: "Dog not found" });
+    if (!doc.exists) return res.status(404).json({ error: 'Dog not found' });
 
-    // Auto-log the view
-    await db.collection('activity_log').add({
+    // Fire-and-forget activity log — don't block the profile response
+    db.collection('activity_log').add({
       dog_id: dogId,
       event_type: 'PROFILE_VIEW',
-      timestamp: serverTimestamp(),
+      timestamp: FieldValue.serverTimestamp(),
       gps_location: gpsLocation,
       status_observed: 'Sighted',
       notes: 'Profile viewed via mobile app',
-      contributor_id: contributor || 'System'
-    });
+      contributor_id: contributor || 'System',
+    }).catch(e => console.error('activity_log write failed:', e));
 
-    res.json({ id: doc.id, ...doc.data() });
+    res.json(flattenDoc(doc));
   } catch (err) {
+    console.error('get dog:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// --- API 3: MANUAL LOG ACTIVITY ---
+// ---------------------------------------------------------------------------
+// API 3: MANUAL LOG ACTIVITY
+// ---------------------------------------------------------------------------
 app.post('/api/log-activity', async (req, res) => {
   const { dog_id, event_type, lat, lon, status_observed, notes, contributor_id } = req.body;
-  if (!dog_id) return res.status(400).json({ error: "dog_id is required" });
+  if (!dog_id) return res.status(400).json({ error: 'dog_id is required' });
 
   try {
     const logData = {
       dog_id,
       event_type: event_type || 'MANUAL_LOG',
-      timestamp: serverTimestamp(),
-      gps_location: (lat && lon) ? `${lat},${lon}` : 'Unknown',
+      timestamp: FieldValue.serverTimestamp(),
+      gps_location: lat && lon ? `${lat},${lon}` : 'Unknown',
       status_observed: status_observed || 'Unknown',
       notes: notes || '',
-      contributor_id: contributor_id || 'Anonymous'
+      contributor_id: contributor_id || 'Anonymous',
     };
     const newLog = await db.collection('activity_log').add(logData);
-    res.status(201).json({ message: "Activity logged", log_id: newLog.id });
+    res.status(201).json({ message: 'Activity logged', log_id: newLog.id });
   } catch (err) {
+    console.error('log-activity:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// --- API 4: GET ACTIVITY LOGS ---
+// ---------------------------------------------------------------------------
+// API 4: GET ACTIVITY LOGS FOR A DOG
+//
+// Firestore requires a COMPOSITE INDEX for (dog_id == ... + orderBy timestamp).
+// Create it in the Firebase console or via firestore.indexes.json:
+//
+//   { "collectionGroup": "activity_log",
+//     "queryScope": "COLLECTION",
+//     "fields": [
+//       { "fieldPath": "dog_id",   "order": "ASCENDING"  },
+//       { "fieldPath": "timestamp","order": "DESCENDING" }
+//     ] }
+// ---------------------------------------------------------------------------
 app.get('/api/dog/:id/activities', async (req, res) => {
   try {
-    const snapshot = await db.collection('activity_log')
+    const snapshot = await db
+      .collection('activity_log')
       .where('dog_id', '==', req.params.id)
       .orderBy('timestamp', 'desc')
       .get();
-    const activities = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    const activities = snapshot.docs.map(flattenDoc);
     res.json({ dog_id: req.params.id, total_logs: activities.length, activities });
   } catch (err) {
+    console.error('get activities:', err);
+    // Surface Firestore "index required" errors clearly
+    if (err.code === 9) {
+      return res.status(500).json({
+        error: 'Missing Firestore composite index for activity_log. See server logs.',
+        details: err.message,
+      });
+    }
     res.status(500).json({ error: err.message });
   }
 });
 
-// --- API 5: LIST ALL DOGS ---
+// ---------------------------------------------------------------------------
+// API 5: LIST ALL DOGS
+// ---------------------------------------------------------------------------
 app.get('/api/dogs', async (req, res) => {
   try {
     const snapshot = await db.collection('dog_profile').get();
-    const dogs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.json(dogs);
+    res.json(snapshot.docs.map(flattenDoc));
   } catch (err) {
+    console.error('list dogs:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// --- API 6: UPDATE DOG PROFILE ---
+// ---------------------------------------------------------------------------
+// API 6: UPDATE DOG PROFILE
+// ---------------------------------------------------------------------------
 app.put('/api/dog/:id', async (req, res) => {
   try {
+    const ref = db.collection('dog_profile').doc(req.params.id);
+
+    // Confirm document exists before updating (Firestore update() throws on missing doc)
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: 'Dog not found' });
+
     const updateData = { ...req.body };
-    delete updateData.id; // Ensure we don't accidentally overwrite the ID field inside the doc
-    await db.collection('dog_profile').doc(req.params.id).update(updateData);
-    res.json({ message: "Dog profile updated successfully" });
+    delete updateData.id; // Never overwrite the document ID field
+    updateData.updated_at = FieldValue.serverTimestamp();
+
+    await ref.update(updateData);
+    res.json({ message: 'Dog profile updated successfully' });
   } catch (err) {
+    console.error('update dog:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// --- API 7: DELETE DOG ---
+// ---------------------------------------------------------------------------
+// API 7: DELETE DOG (+ best-effort cleanup of related sub-collections)
+// ---------------------------------------------------------------------------
 app.delete('/api/dog/:id', async (req, res) => {
+  const dogId = req.params.id;
   try {
-    await db.collection('dog_profile').doc(req.params.id).delete();
-    // Logic for deleting related logs/vaccines would go here if using a flat structure
-    res.json({ message: "Dog profile deleted" });
+    // Firestore does NOT cascade-delete sub-collection documents automatically.
+    // Delete related records in parallel before removing the profile.
+    const relatedCollections = ['activity_log', 'vaccination_records', 'medical_treatments', 'caretakers'];
+
+    await Promise.all(
+      relatedCollections.map(async (col) => {
+        const snap = await db.collection(col).where('dog_id', '==', dogId).get();
+        const batch = db.batch();
+        snap.docs.forEach(d => batch.delete(d.ref));
+        if (!snap.empty) await batch.commit();
+      })
+    );
+
+    await db.collection('dog_profile').doc(dogId).delete();
+    res.json({ message: 'Dog profile and related records deleted' });
   } catch (err) {
+    console.error('delete dog:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// --- VACCINATION RECORDS ---
+// ---------------------------------------------------------------------------
+// VACCINATION RECORDS
+// ---------------------------------------------------------------------------
 app.get('/api/dog/:dogId/vaccines', async (req, res) => {
   try {
-    const snapshot = await db.collection('vaccination_records').where('dog_id', '==', req.params.dogId).get();
-    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const snapshot = await db
+      .collection('vaccination_records')
+      .where('dog_id', '==', req.params.dogId)
+      .get();
+    res.json(snapshot.docs.map(flattenDoc));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/dog/:dogId/vaccines', async (req, res) => {
   try {
-    const data = { ...req.body, dog_id: req.params.dogId };
+    const data = {
+      ...req.body,
+      dog_id: req.params.dogId,
+      created_at: FieldValue.serverTimestamp(),
+    };
     const docRef = await db.collection('vaccination_records').add(data);
     res.status(201).json({ id: docRef.id });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.delete('/api/vaccine/:id', async (req, res) => {
-  await db.collection('vaccination_records').doc(req.params.id).delete();
-  res.json({ message: "Deleted" });
+  try {
+    await db.collection('vaccination_records').doc(req.params.id).delete();
+    res.json({ message: 'Vaccine record deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// --- MEDICAL TREATMENTS ---
+// ---------------------------------------------------------------------------
+// MEDICAL TREATMENTS
+// ---------------------------------------------------------------------------
 app.get('/api/dog/:dogId/treatments', async (req, res) => {
   try {
-    const snapshot = await db.collection('medical_treatments').where('dog_id', '==', req.params.dogId).get();
-    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const snapshot = await db
+      .collection('medical_treatments')
+      .where('dog_id', '==', req.params.dogId)
+      .get();
+    res.json(snapshot.docs.map(flattenDoc));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/dog/:dogId/treatments', async (req, res) => {
   try {
-    const data = { ...req.body, dog_id: req.params.dogId };
+    const data = {
+      ...req.body,
+      dog_id: req.params.dogId,
+      created_at: FieldValue.serverTimestamp(),
+    };
     const docRef = await db.collection('medical_treatments').add(data);
     res.status(201).json({ id: docRef.id });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.put('/api/treatment/:id', async (req, res) => {
   try {
-    await db.collection('medical_treatments').doc(req.params.id).update(req.body);
-    res.json({ message: "Updated" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const ref = db.collection('medical_treatments').doc(req.params.id);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: 'Treatment not found' });
+
+    await ref.update({ ...req.body, updated_at: FieldValue.serverTimestamp() });
+    res.json({ message: 'Treatment updated' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// --- CARETAKERS ---
+// ---------------------------------------------------------------------------
+// CARETAKERS
+// ---------------------------------------------------------------------------
 app.get('/api/dog/:dogId/caretakers', async (req, res) => {
   try {
-    const snapshot = await db.collection('caretakers').where('dog_id', '==', req.params.dogId).get();
-    res.json(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const snapshot = await db
+      .collection('caretakers')
+      .where('dog_id', '==', req.params.dogId)
+      .get();
+    res.json(snapshot.docs.map(flattenDoc));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/dog/:dogId/caretakers', async (req, res) => {
   try {
-    const data = { ...req.body, dog_id: req.params.dogId };
+    const data = {
+      ...req.body,
+      dog_id: req.params.dogId,
+      created_at: FieldValue.serverTimestamp(),
+    };
     const docRef = await db.collection('caretakers').add(data);
     res.status(201).json({ id: docRef.id });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.delete('/api/caretaker/:id', async (req, res) => {
   try {
     await db.collection('caretakers').doc(req.params.id).delete();
-    res.json({ message: "Caretaker removed" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    res.json({ message: 'Caretaker removed' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-
+// ---------------------------------------------------------------------------
+// LOCAL DEV SERVER
+// ---------------------------------------------------------------------------
 if (process.env.NODE_ENV !== 'production') {
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
+  app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
 }
 
+// ---------------------------------------------------------------------------
+// SERVERLESS EXPORT
+// Vercel: set "builds": [{ "src": "index.js", "use": "@vercel/node" }] in vercel.json
+// Netlify: use netlify-lambda or @netlify/functions wrapper around this export
+// ---------------------------------------------------------------------------
 module.exports = app;
-
