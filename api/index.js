@@ -5,14 +5,19 @@ const admin = require('firebase-admin');
 
 // 1. INITIALIZE FIREBASE (Serverless Singleton Pattern)
 if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      // Fix for private key newline characters in environment variables
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    }),
-  });
+  const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+  
+  if (!privateKey) {
+    console.error("CRITICAL: FIREBASE_PRIVATE_KEY is missing!");
+  } else {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: privateKey.replace(/\\n/g, '\n'),
+      }),
+    });
+  }
 }
 
 const db = admin.firestore();
